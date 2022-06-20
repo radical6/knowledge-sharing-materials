@@ -1,0 +1,438 @@
+---
+title: "Some approaches to modeling 1-Year Probability of Default"
+output: html_notebook
+# header-includes: \usepackage{amsmath}
+---
+
+# Outline
+
+- Modeling Preparation
+  - Installing and loading necessary packages
+  - Loading the full dataset
+  - Exploratory Data Analysis (EDA)
+  - Train-Test Split
+- Generalized Linear Models (Logistic Regression)
+  - Weight of Evidence (WoE) and Information Value (IV)
+  - WoE as a data transformation
+  - Fitting logistic regression models for 1-year PD (at application)
+    - Stepwise logistic regression
+    - Multiple factor analysis
+  - Score scaling
+- Non-linear Models (Random Forest)
+  - Fitting a random forest model for 1-year PD (at application)
+  - Variable importance in Random Forest
+  - Differences with logistic regression approaches
+
+# Preparation
+
+## Installing and loading necessary packages
+
+```{r}
+install.packages(c("tidyverse", 
+                   "Hmisc", 
+                   "caret", 
+                   "car", 
+                   "scorecard", 
+                   "randomForest"))
+```
+
+```{r}
+library(randomForest)
+library(scorecard)
+library(car)
+library(caret)
+library(Hmisc)
+library(tidyverse)
+```
+
+
+## Loading the full dataset
+
+```{r}
+demo_data = read_csv("1yrPD_demo_data.csv")
+
+head(demo_data,10)
+```
+
+## Exploratory Data Analysis (EDA)
+
+```{r}
+ggplot(data = demo_data, aes(x = sex)) + 
+  geom_bar()
+ggplot(data = demo_data, aes(x = age_at_application)) + 
+  geom_histogram(binwidth = 5)
+ggplot(data = demo_data, aes(x = civil_status)) + 
+  geom_bar()
+ggplot(data = demo_data, aes(x = educational_attainment)) + 
+  geom_bar() + 
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))
+ggplot(data = demo_data, aes(x = monthly_income)) + 
+  geom_histogram(binwidth = 10000)
+ggplot(data = demo_data, aes(x = monthly_amortization)) + 
+  geom_histogram(binwidth = 1000)
+ggplot(data = demo_data, aes(x = nominal_rate)) + 
+  geom_bar()
+ggplot(data = demo_data, aes(x = everbad_in_12mo)) + 
+  geom_bar()
+```
+
+## Train-Test Split
+
+```{r}
+# set a random seed for reproducible results
+set.seed(1234)
+training_df = demo_data %>% 
+  group_by(everbad_in_12mo) %>% 
+  slice_sample(prop = 0.8) %>% 
+  ungroup()
+
+test_df = demo_data %>% 
+  anti_join(training_df)
+
+head(training_df,10)
+
+head(test_df,10)
+```
+
+# Generalized Linear Models (Logistic Regression)
+
+## Weight of Evidence (WoE) and Information Value (IV)
+
+The Weight of Evidence (WoE) for when a variable $x_{i}$ takes values inside the bin $b_{i,j}$ is defined as
+
+$$
+\text{WoE}(x_i,b_{i,j}) := \ln\left(\frac{\text{% Goods when variable }x_{i} \text{ is in bin } b_{i,j}}{\text{% Bads when variable }x_{i} \text{ is in bin } b_{i,j}}\right)
+$$
+
+In some references and implementations of WoE in R (such as in the *woebin* function in the *scorecard* package we will be using), the numerator and denominator inside the $\ln$ is sometimes switched, such that the resulting WoE value is negated. The motivation for the definition with the % Bads in the numerator leads to values that have a positive relationship to the resulting probabilities predicted by the logistic regression model. In turn, said values will have a negative relationship with the resulting scores, since the scores will be scaled such that a higher score corresponds to a lesser probability of default. For us, we will use the definition with the % Goods in the numerator, which will lead to WoE values that have a positive relationship with the resulting scores.
+
+The (total) Information Value (IV) for a variable $x_{i}$ (with the above definition of WoE) is given by
+
+$$
+\text{IV}(x_{i}) = \sum\limits_{j} \left[\text{WoE}(x_i,b_{i,j})\times\left(\text{% Goods when variable }x_{i} \text{ is in bin } b_{i,j} - \text{% Bads when variable }x_{i} \text{ is in bin } b_{i,j}\right) \right]
+$$
+
+| IV Range | Strength | Description |
+|:--------:|:--------:|:-----------:|
+| $\text{IV}(x_{i}) \leq 0.01$  | Uncorrelated | Drop, unless sound reason to consider further. |
+| $0.01 < \text{IV}(x_{i}) \leq 0.05$ | Very weak | May add value, but can be dropped with minimal loss. |
+| $0.05 < \text{IV}(x_{i}) \leq 0.10$ | Weak | Possible spurious correlation, unlikely to feature. |
+| $0.10 < \text{IV}(x_{i}) \leq 0.30$ | Medium | Known correlation, which could appear. |
+| $0.30 < \text{IV}(x_{i}) \leq 0.50$ | Strong | High information content, and sought after. |
+| $0.50 < \text{IV}(x_{i}) \leq 1.00$ | Dominant! | Very powerful, but investigate why. |
+| $\text{IV}(x_{i}) > 1.00$ | Warning! | Possible error, perhaps outcome posing as observation. |
+
+```{r}
+# specify manual breaks in the break_list argument
+# the set of all possible values for nominal_rate is specified so it can be treated as a categorical variable
+# for variables not in breaks_list, woebin automatically determines optimal binnings
+# woebin uses woe = ln(Pos_i/Neg_i) by default, which can be changed by setting the positive argument to 0 (0 in everbad_in_12mo means the account was good)
+training_woebin = woebin(dt = training_df, 
+                         y = "everbad_in_12mo", 
+                         var_skip=c("borrower_id"), 
+                         breaks_list = list(nominal_rate = c(0.05,0.1,0.15)), 
+                         positive = 0)
+```
+
+```{r}
+training_woebin$sex %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$sex$bin_iv)
+```
+
+Conclusion: *sex* is an Uncorrelated predictor.
+
+```{r}
+training_woebin$age_at_application %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$age_at_application$bin_iv)
+```
+
+Conclusion: *age_at_application* is an Uncorrelated predictor.
+
+```{r}
+training_woebin$civil_status %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$civil_status$bin_iv)
+```
+
+Conclusion: *civil_status* is an Uncorrelated predictor.
+
+```{r}
+training_woebin$educational_attainment %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$educational_attainment$bin_iv)
+```
+
+Conclusion: *educational_attainment* is a Medium predictor.
+
+```{r}
+training_woebin$monthly_income %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$monthly_income$bin_iv)
+```
+
+Conclusion: *monthly_income* is a Strong predictor.
+
+```{r}
+training_woebin$monthly_amortization %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$monthly_amortization$bin_iv)
+```
+
+Conclusion: *monthly_amortization* is a Strong predictor.
+
+```{r}
+training_woebin$nominal_rate %>% 
+  select(variable, bin, breaks, woe, bin_iv, count, count_distr, bads = neg, goods = pos, prob_good = posprob)
+# summing the bin_iv column from woebin's result gives the (total) IV of the variable
+sum(training_woebin$nominal_rate$bin_iv)
+```
+
+Conclusion: *nominal_rate* is a Medium predictor.
+
+## WoE as a data transformation
+
+```{r}
+training_df_woe = woebin_ply(training_df, training_woebin)
+head(training_df_woe,10)
+```
+
+```{r}
+test_df_woe = woebin_ply(test_df, training_woebin)
+head(test_df_woe,10)
+```
+
+## Fitting logistic regression models for 1-year PD (at application)
+
+### Stepwise logistic regression
+
+```{r}
+all_vars_model = glm(everbad_in_12mo ~ ., 
+                     family = binomial(link = 'logit'), 
+                     data = training_df_woe %>% select(-borrower_id))
+summary(all_vars_model)
+```
+
+```{r}
+stepwise_from_all_model = step(all_vars_model, direction = 'both')
+```
+
+```{r}
+summary(stepwise_from_all_model)
+```
+Note that the *stepwise_from_all_model* has included the variable *age_at_application_woe*, of which the non-transformed version,  *age_at_application*, has been deemed as an Uncorrelated predictor earlier.
+
+```{r}
+shortlisted_vars_model = glm(everbad_in_12mo ~ educational_attainment_woe + monthly_income_woe + monthly_amortization_woe + nominal_rate_woe, 
+                     family = binomial(link = 'logit'), 
+                     data = training_df_woe)
+summary(shortlisted_vars_model)
+```
+
+```{r}
+stepwise_from_shortlisted_model = step(shortlisted_vars_model, direction = 'both')
+```
+
+```{r}
+summary(stepwise_from_shortlisted_model)
+```
+Note that *shortlisted_vars_model* and *stepwise_from_shortlisted_model* are one and the same.
+
+```{r}
+# define a function to evaluate some statistics for a model given the selected independent variables
+get_model_stats = function(indep_vars, dep_var, train_data, test_data) {
+  lr_formula = paste0(dep_var, " ~ ", paste0(indep_vars, collapse = " + "), " + 1")
+  
+  print(lr_formula)
+  
+  lr_model = glm(formula = lr_formula, 
+                 family = binomial(link = 'logit'), 
+                 data = train_data)
+  
+  lr_model_summary = summary(lr_model)
+  alias_reindex = ifelse(!lr_model_summary$aliased,cumsum(!lr_model_summary$aliased),NA)
+  lr_model_summary_stats = lr_model_summary$coefficients[alias_reindex,]
+  
+  if(any(lr_model_summary$aliased)) {
+    lr_model_vif = rep(NA,length(indep_vars))
+  } else {
+    lr_model_vif = vif(lr_model)
+  }
+  
+  actual_response_train = train_data %>% pull(dep_var)
+  pred_prob_train = predict(lr_model, 
+                            newdata = train_data, 
+                            type = "response")
+  pred_response_train = as.numeric(pred_prob_train >= 0.5)
+  
+  conf_mat_train = confusionMatrix(as.factor(pred_response_train), 
+                                   as.factor(actual_response_train), 
+                                   positive = "1", 
+                                   mode = "everything")
+  
+  KS_train = ks.test(pred_prob_train[actual_response_train == 0], 
+                     pred_prob_train[actual_response_train == 1])
+  
+  rcorr_train = rcorr.cens(pred_prob_train, actual_response_train)
+  
+  actual_response_test = test_data %>% pull(dep_var)
+  pred_prob_test = predict(lr_model, 
+                           newdata = test_data, 
+                           type = "response")
+  pred_response_test = as.numeric(pred_prob_test >= 0.5)
+  
+  conf_mat_test = confusionMatrix(as.factor(pred_response_test), 
+                                  as.factor(actual_response_test), 
+                                  positive = "1", 
+                                  mode = "everything")
+  
+  KS_test = ks.test(pred_prob_test[actual_response_test == 0], 
+                    pred_prob_test[actual_response_test == 1])
+  
+  rcorr_test = rcorr.cens(pred_prob_test, actual_response_test)
+  
+  return_names = c("intercept", paste0("coeff_X", 1:length(indep_vars)), 
+                   "stderr_intercept", paste0("stderr_X", 1:length(indep_vars)), 
+                   "z-value_intercept", paste0("z-value_X", 1:length(indep_vars)), 
+                   "p-value_intercept", paste0("p-value_X", 1:length(indep_vars)), 
+                   paste0("vif_X", 1:length(indep_vars)), 
+                   "AIC", 
+                   "BIC", 
+                   "train_KS_stat", 
+                   "train_KS_p-value", 
+                   paste0("train_", c("AUC", "Gini")), 
+                   "train_Brier_score", 
+                   paste0("train_", c("TN", "FP", "FN", "TP")), 
+                   paste0("train_", names(conf_mat_train$overall)), 
+                   paste0("train_", names(conf_mat_train$byClass)), 
+                   "test_KS_stat", 
+                   "test_KS_p-value", 
+                   paste0("test_", c("AUC", "Gini")), 
+                   "test_Brier_score", 
+                   paste0("test_", c("TN", "FP", "FN", "TP")), 
+                   paste0("test_", names(conf_mat_test$overall)), 
+                   paste0("test_", names(conf_mat_test$byClass)))
+  
+  c(lr_model_summary_stats[, "Estimate"], 
+    lr_model_summary_stats[, "Std. Error"], 
+    lr_model_summary_stats[, "z value"], 
+    lr_model_summary_stats[, "Pr(>|z|)"], 
+    lr_model_vif, 
+    AIC(lr_model), 
+    BIC(lr_model), 
+    KS_train$statistic, 
+    KS_train$p.value, 
+    rcorr_train[c("C Index","Dxy")], 
+    mean((pred_prob_train - actual_response_train)^2), 
+    conf_mat_train$table %>% data.frame %>% arrange(Reference, Prediction) %>% pull(Freq), 
+    conf_mat_train$overall, 
+    conf_mat_train$byClass, 
+    KS_test$statistic, 
+    KS_test$p.value, 
+    rcorr_test[c("C Index","Dxy")], 
+    mean((pred_prob_test - actual_response_test)^2), 
+    conf_mat_test$table %>% data.frame %>% arrange(Reference, Prediction) %>% pull(Freq), 
+    conf_mat_test$overall, 
+    conf_mat_test$byClass) %>% setNames(return_names)
+}
+```
+
+```{r}
+shortlisted_vars = c("nominal_rate_woe", 
+                     "educational_attainment_woe", 
+                     "monthly_income_woe", 
+                     "monthly_amortization_woe")
+get_model_stats(shortlisted_vars, 
+                "everbad_in_12mo", 
+                train_data = training_df_woe, 
+                test_data = test_df_woe) %>% 
+  t %>% 
+  data.frame %>% 
+  cbind(data.frame(X1 = "nominal_rate_woe", 
+                   X2 = "educational_attainment_woe", 
+                   X3 = "monthly_income_woe", 
+                   X4 = "monthly_amortization_woe"),.)
+```
+### Multiple factor analysis
+
+```{r}
+num_vars_taken = 3
+mfa_runs = t(combn(shortlisted_vars,num_vars_taken)) %>% data.frame
+mfa_runs
+```
+
+```{r}
+mfa_runs_stats = cbind(mfa_runs, 
+                       t(apply(mfa_runs, 1, 
+                               get_model_stats, 
+                               dep_var = "everbad_in_12mo", 
+                               train_data = training_df_woe, 
+                               test_data = test_df_woe)))
+```
+```{r}
+mfa_runs_stats
+```
+
+### Score scaling
+
+```{r}
+# define a function to scale the predicted probabilities into a score 
+scaled_score = function(pred_p, odds, offset = 500, pdo = 20) {
+  b = pdo/log(2)
+  a = offset - b*log(odds)
+  round(a + b*log((1-pred_p)/pred_p))
+}
+
+# define a function to scale (WoE*coefficient) into the contribution of the variable to the score 
+scaled_contrib = function(woe_x_coeff, odds, offset = 500, pdo = 20) {
+  b = pdo/log(2)
+  a = offset - b*log(odds)
+  round(-b*woe_x_coeff)
+}
+
+train_pred_p = predict(shortlisted_vars_model, newdata = training_df_woe, type='response')
+
+train_scaled_score = scaled_score(train_pred_p, 72, 660, 40)
+train_scaled_score[1:10]
+
+scaled_contrib(shortlisted_vars_model$coefficients["monthly_income_woe"]*(training_woebin$monthly_income$woe %>% setNames(training_woebin$monthly_income$bin)), 72, 660, 40)
+# base score is a + contribution of intercept
+round(660 - (40/log(2))*log(72))
+# base score is a + contribution of intercept
+scaled_contrib(shortlisted_vars_model$coefficients["(Intercept)"], 72, 660, 40)
+```
+```{r}
+rf_model = randomForest(everbad_in_12mo ~ ., data = training_df %>% select(-borrower_id) %>% mutate(everbad_in_12mo = as.factor(everbad_in_12mo)), importance = TRUE, proximity = TRUE)
+```
+
+```{r}
+rf_model
+```
+
+# Non-linear Models (Random Forest)
+
+## Fitting a random forest model for 1-year PD (at application)
+
+```{r}
+rf_test_pred_p = predict(rf_model,newdata = test_df %>% select(-c(borrower_id, everbad_in_12mo)), type="prob")
+rf_test_pred_p[1:10,]
+```
+## Variable importance in Random Forest
+
+```{r}
+# plot variable importance
+varImpPlot(rf_model)
+```
+
+## Differences with logistic regression approaches
+
+- Random Forest can use the data without WoE transformation
+- Unlike Logistic Regression, Random Forest does not output coefficients
+- Hence, there is no measure of direct contribution to a score
